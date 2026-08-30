@@ -277,13 +277,3 @@ These scripts were written out of real pain — migrating machines, rebuilding e
 If you've ever spent three days re-creating your workstation from scratch, these scripts are for you.
 
 ---
-
-## Topics
-
-```
-ubuntu gnome backup restore dotfiles dconf apt snap systemd migration desktop-configuration bash
-```
-
----
-
-*Built by engineers who migrate machines. Shared for everyone who does the same.*
