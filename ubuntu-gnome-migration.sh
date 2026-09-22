@@ -88,18 +88,33 @@ DOTFILES=(
 # ==============================================================================
 info()    { echo -e "\e[32m>>> $* \e[0m"; }
 warning() { echo -e "\e[33m!!! $* \e[0m"; }
-error()   { echo -e "\e[31m[ERROR] $* \e[0m" >&2; }
 header()  { echo -e "\n\e[1m── $* ──\e[0m"; }
 
 # ==============================================================================
 # Signal & Error Handling
 # ==============================================================================
+# graceful_exit closes INT and ERR traps before exit.
+# EXIT trap is intentionally preserved so the sudo keep-alive cleanup runs.
+graceful_exit() {
+    local code="${1:-0}"
+    CURRENT_STEP=""
+    trap - INT ERR
+    exit "${code}"
+}
+
+# error() prints to stderr and exits via graceful_exit for a unified cleanup path.
+# NOTE: graceful_exit must be defined before this function.
+error() { echo -e "\e[31m[ERROR] $* \e[0m" >&2; graceful_exit 1; }
+
 on_error() {
     local exit_code=$?
     local line=$1
-    echo -e "\e[31m\n[FAILED] Script exited unexpectedly at line ${line} (exit code: ${exit_code}).\e[0m"
-    echo -e "\e[33mPlease review the output above and resolve the issue manually.\e[0m"
-    exit $exit_code
+    if [[ -n "${CURRENT_STEP}" ]]; then
+        echo -e "\e[31m\n[FAILED] Unhandled error in step '${CURRENT_STEP}' at line ${line} (exit code: ${exit_code}).\e[0m" >&2
+    else
+        echo -e "\e[31m\n[FAILED] Script exited unexpectedly at line ${line} (exit code: ${exit_code}).\e[0m" >&2
+    fi
+    graceful_exit "${exit_code}"
 }
 trap 'on_error $LINENO' ERR
 
@@ -107,43 +122,37 @@ handle_sigint() {
     echo ""
     if [[ -n "${CURRENT_STEP}" ]]; then
         warning "Interrupted during step: ${CURRENT_STEP}"
-        read -rp "Step not complete. Exit anyway? [y/N] " choice || true
-        if [[ "${choice}" =~ ^[Yy]$ ]]; then
-            error "Aborted by user."
-            exit 130
-        else
-            info "Resuming..."
-            trap handle_sigint INT
-        fi
     else
-        warning "Interrupted. Exiting."
-        exit 130
+        warning "Interrupted by user (Ctrl+C)."
     fi
+    trap - INT ERR
+    exit 130
 }
 trap handle_sigint INT
-
-graceful_exit() {
-    local code="${1:-0}"
-    CURRENT_STEP=""
-    trap - INT
-    exit "${code}"
-}
 
 # ==============================================================================
 # Helper Checks & Usage
 # ==============================================================================
 check_environment() {
-    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -d "/run/user/$(id -u)" ]; then
-        export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+    local uid bus_path
+    uid="$(id -u)"
+    bus_path="/run/user/${uid}/bus"
+
+    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "${bus_path}" ]; then
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=${bus_path}"
     fi
 
     if [[ "${EUID}" -eq 0 ]]; then
         warning "Running this script directly with sudo/root changes \$HOME to /root."
         warning "This may restore dotfiles to /root and fail to load GNOME dconf settings."
-        read -rp "Are you sure you want to continue as root? [y/N] " root_choice || true
-        if [[ ! "${root_choice}" =~ ^[Yy]$ ]]; then
-            error "Aborted. Please run as normal user (it will prompt for sudo when needed)."
-            exit 1
+        if [ -t 0 ]; then
+            local root_choice=""
+            read -rp "Are you sure you want to continue as root? [y/N] " root_choice || true
+            if [[ ! "${root_choice}" =~ ^[Yy]$ ]]; then
+                error "Aborted. Please run as normal user (it will prompt for sudo when needed)."
+            fi
+        else
+            error "Non-interactive root shell detected. Please run as a normal user."
         fi
     fi
 }
@@ -155,7 +164,7 @@ usage() {
     echo "  ${script} backup  [output-dir]   # Backup to specified directory (default: current dir)"
     echo "  ${script} restore <backup-dir>   # Restore from backup directory"
     echo "  ${script} --help                 # Show this help message"
-    [[ "${1:-}" == "err" ]] && graceful_exit 1 || graceful_exit 0
+    graceful_exit 0
 }
 
 # ==============================================================================
@@ -164,7 +173,6 @@ usage() {
 step_backup_init() {
     if [[ ! -d "${DEST_BASE}" ]]; then
         error "Output directory does not exist: ${DEST_BASE}"
-        graceful_exit 1
     fi
     BACKUP_DIR="${DEST_BASE}/${DEFAULT_BACKUP_NAME}"
     header "Starting Backup"
@@ -339,12 +347,12 @@ step_backup_summary() {
 step_restore_init() {
     if [[ ! -d "${BACKUP_DIR}" ]]; then
         error "Backup directory does not exist: ${BACKUP_DIR}"
-        graceful_exit 1
     fi
     if [[ ! -f "${BACKUP_DIR}/BACKUP_INFO.txt" ]]; then
         warning "BACKUP_INFO.txt not found — this may not be a valid backup directory."
-        read -rp "Continue anyway? [y/N] " check || true
-        [[ "${check}" =~ ^[Yy]$ ]] || { info "Aborted."; graceful_exit 0; }
+        local proceed=""
+        read -rp "Continue anyway? [y/N] " proceed || true
+        [[ "${proceed}" =~ ^[Yy]$ ]] || { info "Aborted."; graceful_exit 0; }
     fi
 
     header "Starting Restore"
@@ -356,6 +364,7 @@ step_restore_init() {
         echo ""
     fi
 
+    local confirm=""
     read -rp "Confirm restore from this backup? [y/N] " confirm || true
     [[ "${confirm}" =~ ^[Yy]$ ]] || { info "Aborted."; graceful_exit 0; }
 }
@@ -529,12 +538,11 @@ case "${1:-}" in
     restore)
         BACKUP_DIR="${2:-}"
         if [[ -z "${BACKUP_DIR}" ]]; then
-            error "No backup directory specified."
-            usage err
+            error "No backup directory specified. Use --help for usage."
         fi
 
         info "Restore requires sudo for apt and snap. Authenticating..."
-        sudo -v || { error "sudo authentication failed."; exit 1; }
+        sudo -v || error "sudo authentication failed."
 
         ( while true; do sudo -n true; sleep 60; kill -0 "$$" || exit; done ) 2>/dev/null &
         SUDO_KP_PID=$!
@@ -547,7 +555,6 @@ case "${1:-}" in
         usage
         ;;
     *)
-        error "Unknown command: ${1:-}"
-        usage err
+        error "Unknown command: ${1:-}. Use --help for usage."
         ;;
 esac

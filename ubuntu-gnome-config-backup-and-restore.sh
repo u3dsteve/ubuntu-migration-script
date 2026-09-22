@@ -15,7 +15,6 @@ PIPELINE_BACKUP=(
     step_backup_init
     step_backup_dconf_shell
     step_backup_dconf_desktop
-    step_backup_dconf_wm
     step_backup_files_extensions
     step_backup_files_gtk3
     step_backup_files_gtk4
@@ -25,7 +24,6 @@ PIPELINE_RESTORE=(
     step_restore_precheck
     step_restore_dconf_shell
     step_restore_dconf_desktop
-    step_restore_dconf_wm
     step_restore_files_extensions
     step_restore_files_gtk3
     step_restore_files_gtk4
@@ -61,24 +59,25 @@ handle_sigint() {
     echo ""
     if [[ -n "${CURRENT_STEP}" ]]; then
         warning "Interrupted during step: ${CURRENT_STEP}"
-        if [ -t 0 ]; then
-            read -rp "Step not confirmed complete. Exit anyway? [y/N] " choice || true
-            if [[ "${choice}" =~ ^[Yy]$ ]]; then
-                echo -e "\e[31m[ABORTED] Stopped mid '${CURRENT_STEP}'. Re-run to retry that step.\e[0m"
-                exit 130
-            else
-                info "Resuming..."
-                trap handle_sigint INT
-            fi
-        else
-            exit 130
-        fi
+        echo -e "\e[31m[ABORTED] Stopped mid '${CURRENT_STEP}'. Re-run to retry that step.\e[0m"
     else
         warning "Interrupted. Exiting."
-        exit 130
     fi
+    trap - INT ERR
+    exit 130
 }
 trap handle_sigint INT
+
+usage() {
+    local script
+    script="$(basename "$0")"
+    echo -e "\e[1mUsage:\e[0m"
+    echo "  ${script} --backup  [--force]   # Backup current GNOME settings"
+    echo "  ${script} --restore [--force]   # Restore from backup"
+    echo "  ${script}                       # Interactive menu"
+    echo "  ${script} --help                # Show this help message"
+    exit 0
+}
 
 # Sync directories cleanly
 sync_dir() {
@@ -96,9 +95,18 @@ sync_dir() {
 
 # Pre-flight environment check
 check_environment() {
-    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -d "/run/user/$(id -u)" ]; then
-        export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+    local uid bus_path
+    uid="$(id -u)"
+    bus_path="/run/user/${uid}/bus"
+
+    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "${bus_path}" ]; then
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=${bus_path}"
     fi
+
+    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+        error "No D-Bus session bus available. Run this from a logged-in desktop session."
+    fi
+
     command -v dconf >/dev/null 2>&1 || error "dconf not found. Install it with: sudo apt install dconf-cli"
 }
 
@@ -109,8 +117,9 @@ check_root_safety() {
         warning "Do NOT restore this backup to a non-root user — paths will mismatch."
         if [ "$FORCE" = false ]; then
             [ -t 0 ] || error "Non-interactive shell detected. Please run with -f/--force."
-            read -rp "Continue anyway? (y/N): " CONFIRM_ROOT || true
-            [[ ! "$CONFIRM_ROOT" =~ ^[Yy]$ ]] && error "Aborted."
+            local confirm_root=""
+            read -rp "Continue anyway? (y/N): " confirm_root || true
+            [[ ! "$confirm_root" =~ ^[Yy]$ ]] && error "Aborted."
         fi
     fi
 }
@@ -129,13 +138,8 @@ step_backup_dconf_shell() {
 }
 
 step_backup_dconf_desktop() {
-    info "Exporting dconf: /org/gnome/desktop/"
+    info "Exporting dconf: /org/gnome/desktop/ (includes wm subtree)"
     dconf dump /org/gnome/desktop/ > "$DCONF_DIR/desktop.ini"
-}
-
-step_backup_dconf_wm() {
-    info "Exporting dconf: /org/gnome/desktop/wm/"
-    dconf dump /org/gnome/desktop/wm/ > "$DCONF_DIR/wm.ini"
 }
 
 step_backup_files_extensions() {
@@ -175,8 +179,9 @@ step_restore_precheck() {
     if [ "$FORCE" = false ]; then
         [ -t 0 ] || error "Non-interactive shell detected. Please run with -f/--force."
         warning "This will overwrite your current GNOME settings with the backup."
-        read -rp "Continue? (y/N): " CONFIRM || true
-        [[ ! "$CONFIRM" =~ ^[Yy]$ ]] && error "Aborted."
+        local confirm=""
+        read -rp "Continue? (y/N): " confirm || true
+        [[ ! "$confirm" =~ ^[Yy]$ ]] && error "Aborted."
     fi
 }
 
@@ -192,21 +197,11 @@ step_restore_dconf_shell() {
 
 step_restore_dconf_desktop() {
     if [ -f "$DCONF_DIR/desktop.ini" ]; then
-        info "Restoring dconf: /org/gnome/desktop/"
+        info "Restoring dconf: /org/gnome/desktop/ (includes wm subtree)"
         dconf reset -f /org/gnome/desktop/
         dconf load /org/gnome/desktop/ < "$DCONF_DIR/desktop.ini"
     else
         warning "desktop.ini not found, skipping."
-    fi
-}
-
-step_restore_dconf_wm() {
-    if [ -f "$DCONF_DIR/wm.ini" ]; then
-        info "Restoring dconf: /org/gnome/desktop/wm/"
-        dconf reset -f /org/gnome/desktop/wm/
-        dconf load /org/gnome/desktop/wm/ < "$DCONF_DIR/wm.ini"
-    else
-        warning "wm.ini not found, skipping."
     fi
 }
 
@@ -273,8 +268,11 @@ while [[ $# -gt 0 ]]; do
             ACTION="restore"
             shift
             ;;
+        -h|--help)
+            usage
+            ;;
         *)
-            error "Unknown option: $1. Supported flags: -b/--backup, -r/--restore, -f/--force"
+            error "Unknown option: $1. Supported flags: -b/--backup, -r/--restore, -f/--force, -h/--help"
             ;;
     esac
 done
@@ -312,6 +310,7 @@ echo "=============================="
 echo "  1) Backup current settings"
 echo "  2) Restore from backup"
 echo "=============================="
+CHOICE=""
 read -rp "Select an option (1/2): " CHOICE || true
 
 case "$CHOICE" in
